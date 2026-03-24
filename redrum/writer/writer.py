@@ -93,6 +93,7 @@ while True:
     time.sleep(sleep_sec)
 
     try:
+        written_at = time.time()
         vecs = normalize(np.random.randn(WRITE_COUNT, VECTOR_DIM).astype("float32"), norm="l2")
         ids  = [str(uuid.uuid4()) for _ in range(WRITE_COUNT)]
         vectors = [
@@ -104,7 +105,6 @@ while True:
             for i in range(WRITE_COUNT)
         ]
 
-        written_at = time.time()
         total = smart_upsert(index, vectors)
         print(f"[writer] done — {total} vectors upserted total", flush=True)
 
