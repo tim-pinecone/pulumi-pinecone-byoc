@@ -45,6 +45,25 @@ ddb   = boto3.resource("dynamodb")
 table = ddb.Table(TABLE_NAME)
 
 
+def _upsert_lsn(result) -> tuple[int | None, int | None]:
+    """Extract (write_lsn, server_latency_ms) from an upsert response."""
+    if not hasattr(result, "_response_info"):
+        return None, None
+    h = result._response_info.get("raw_headers", {})
+    lsn = h.get("x-pinecone-request-lsn")
+    lat = h.get("x-pinecone-request-latency-ms")
+    return (int(lsn) if lsn else None), (int(lat) if lat else None)
+
+
+def _fetch_lsn(result) -> int | None:
+    """Extract max_indexed_lsn from a fetch/query response."""
+    if not hasattr(result, "_response_info"):
+        return None
+    h = result._response_info.get("raw_headers", {})
+    lsn = h.get("x-pinecone-max-indexed-lsn")
+    return int(lsn) if lsn else None
+
+
 # ---------------------------------------------------------------------------
 # Stream mode
 # ---------------------------------------------------------------------------
@@ -107,28 +126,33 @@ def probe_handler(event, context):
 
     print(f"[probe] starting — duration={duration}s upsert_every={upsert_interval}s poll={int(poll_interval*1000)}ms", flush=True)
 
-    samples   = []
-    timeouts  = 0
-    run_until = time.time() + duration
-    n         = 0
+    samples      = []       # latency_ms per visible vector
+    lsn_samples  = []       # {latency_ms, write_lsn, max_indexed_lsn, lsn_delta}
+    timeouts     = 0
+    run_until    = time.time() + duration
+    n            = 0
 
     while time.time() < run_until:
         vid = str(uuid.uuid4())
         vec = normalize(np.random.randn(1, VECTOR_DIM).astype("float32"), norm="l2")[0].tolist()
 
-        t_upsert = time.time()
-        index.upsert(vectors=[{
+        t_upsert    = time.time()
+        upsert_resp = index.upsert(vectors=[{
             "id": vid,
             "values": vec,
             "metadata": {"source": "probe", "written_at": t_upsert, "dim": VECTOR_DIM},
         }])
+        write_lsn, upsert_server_lat = _upsert_lsn(upsert_resp)
         t0 = time.time()  # clock starts after Pinecone ACKs the write
 
-        deadline = t0 + vector_timeout
-        seen = False
+        deadline         = t0 + vector_timeout
+        seen             = False
+        max_indexed_lsn  = None
         while time.time() < deadline:
             try:
-                if vid in (index.fetch(ids=[vid]).vectors or {}):
+                fetch_resp = index.fetch(ids=[vid])
+                max_indexed_lsn = _fetch_lsn(fetch_resp) or max_indexed_lsn
+                if vid in (fetch_resp.vectors or {}):
                     latency_ms = int((time.time() - t0) * 1000)
                     samples.append(latency_ms)
                     seen = True
@@ -139,21 +163,33 @@ def probe_handler(event, context):
 
         n += 1
         if seen:
-            print(f"[probe] {n} id={vid[:8]} latency={latency_ms}ms", flush=True)
+            lsn_delta = (max_indexed_lsn - write_lsn) if (write_lsn is not None and max_indexed_lsn is not None) else None
+            lsn_samples.append({
+                "latency_ms":      latency_ms,
+                "write_lsn":       write_lsn,
+                "max_indexed_lsn": max_indexed_lsn,
+                "lsn_delta":       lsn_delta,
+            })
+            print(
+                f"[probe] {n} id={vid[:8]} latency={latency_ms}ms "
+                f"write_lsn={write_lsn} max_indexed_lsn={max_indexed_lsn} delta={lsn_delta}",
+                flush=True,
+            )
         else:
             timeouts += 1
             print(f"[probe] {n} id={vid[:8]} timeout (>{vector_timeout}s)", flush=True)
 
         # sleep for the remainder of the upsert interval
-        elapsed = time.time() - t0
+        elapsed   = time.time() - t0
         remaining = upsert_interval - elapsed
         if remaining > 0 and time.time() + remaining < run_until:
             time.sleep(remaining)
 
     result = {
-        "samples":    samples,
-        "timeouts":   timeouts,
-        "count":      len(samples),
+        "samples":     samples,
+        "lsn_samples": lsn_samples,
+        "timeouts":    timeouts,
+        "count":       len(samples),
     }
     if samples:
         result["p50_ms"] = int(statistics.median(samples))
@@ -164,5 +200,16 @@ def probe_handler(event, context):
             result["p95_ms"] = int(qs[94])
             result["p99_ms"] = int(qs[98])
 
-    print(f"[probe] done — {len(samples)} samples, {timeouts} timeouts, p50={result.get('p50_ms')}ms", flush=True)
+    # LSN delta stats (how many log entries behind when vector first became visible)
+    deltas = [s["lsn_delta"] for s in lsn_samples if s.get("lsn_delta") is not None]
+    if deltas:
+        result["lsn_delta_min"] = min(deltas)
+        result["lsn_delta_max"] = max(deltas)
+        result["lsn_delta_p50"] = int(statistics.median(deltas))
+
+    print(
+        f"[probe] done — {len(samples)} samples, {timeouts} timeouts, "
+        f"p50={result.get('p50_ms')}ms lsn_delta_p50={result.get('lsn_delta_p50')}",
+        flush=True,
+    )
     return result

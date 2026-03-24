@@ -1,3 +1,4 @@
 pinecone
 numpy
 scikit-learn
+boto3
