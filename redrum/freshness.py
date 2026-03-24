@@ -188,7 +188,7 @@ def pct(values: list[int], p: int) -> str:
 
 
 def fmt_ms(ms) -> str:
-    return f"{int(ms) / 1000:.2f}s" if ms is not None else "—"
+    return f"{int(ms)}ms" if ms is not None else "—"
 
 
 def fmt_ts(epoch) -> str:
@@ -496,7 +496,7 @@ def generate_report():
             ["p50", "p75", "p95", "p99", "min", "max", "samples"],
             [[pct(fresh_latencies, 50), pct(fresh_latencies, 75),
               pct(fresh_latencies, 95), pct(fresh_latencies, 99),
-              fmt_ms(min(fresh_latencies)), fmt_ms(max(fresh_latencies)),
+              f"{min(fresh_latencies) / 1000:.2f}s", f"{max(fresh_latencies) / 1000:.2f}s",
               str(len(fresh_latencies))]],
         ))
     else:
